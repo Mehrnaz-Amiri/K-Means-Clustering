@@ -1,0 +1,936 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# # Profiling Algorithm for Valtoto
+
+# # Table of Contents
+# * [Connecting to the Snowflake](#Connecting to Snowflake)
+# * [Feature Engineering including the following steps](#Feature Engineering including the following steps)
+#   * [Create new variables](#Create new variables)
+#   * [Dealing with missing values](#Dealing with missing values)
+#   * [Removing Outliers](#Removing Outliers)
+# * [A subset of the dataset that is used as input in the model (Selected columns)](#A subset of the dataset that is used as input in the model (Selected columns))
+# * [K-mean Clustering](#K-mean Clustering)
+#   * [Standardization data](#Standardization data)
+#   * [Select the desired number of clusters (K)](#Select the desired number of clusters (K))
+#   * [Number of HCPs per cluster](#Number of HCPs per cluster)
+# * [Some information/details about HCPs per cluster](#Some information/details about HCPs per cluster)
+#   * [HCPs States](#HCPs States)
+#   * [HCPs Gender](#HCPs Gender)
+#   * [HCPs TRx, Calls, Exposures, and Engagements](#HCPs TRx, Calls, Exposures, and Engagements)
+#   * [HCPs Brand TRx Versus Market TRx](#HCPs TRx)
+#   * [HCPs Product Type](#HCPs TRx Type)
+#   * [HCPs Brand Names](#HCPs TRx Names)
+#   * [HCPs Degree](#HCPs Degree)
+#   * [HCPs Specialty](#HCPs Specialty)
+#   * [HCPs Stage/Segment](#HCPs Stage)
+#   * [HCPs Time of NPP Activity](#HCPs Time of NPP Activity)
+#   * [HCPs Type of NPP Activity](#HCPs Type of NPP Activity)
+#   * [HCPs Media Partners](#HCPs Media Partners)
+#   * [HCPs Duration to First Rx](#HCPs Duration to First Rx)
+#   * [Duration to First Rx for Rep Called On, NPP Exposed, and NPP Engaged HCPs](#HCPs Duration)
+#   * [HCPs Target Type](#HCPs Target Type)
+#   * [HCPs Call Types](#HCPs Call Types)
+#   * [HCPs Messages](#HCPs Messages)
+#   * [HCPs Tactic](#HCPs Tactic)
+# * [Conclusion](#Conclusion)
+#   
+
+# In[1]:
+
+
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+import statsmodels.formula.api as sm
+import statsmodels.api as sm
+from numpy.random import randn
+from numpy.random import seed
+from scipy.stats import pearsonr
+import snowflake.connector
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+import nbconvert
+from sklearn.cluster import KMeans
+from IPython.display import Markdown as md
+import warnings
+warnings.filterwarnings('ignore')
+
+
+# ## Connecting to the Snowflake  <a name="Connecting to Snowflake"></a>
+# 
+# Import ACTIVITY_NPP_ALL, ACTIVITY_REP_CALL, ACTIVITY_RX_SALES, and EXTRACT_TARGET_ATTRIBUTES_HTD tables from Snowflake into the Python. (For Now, the dataset is created in R, exported to Snowflake, and imported into Python. Once the last-mile tasks are completed, the data will be prepared in Python.)
+
+# In[2]:
+
+
+cnn = snowflake.connector.connect(user='',
+                 password='',
+                 account='',
+                 warehouse='',
+                 role = "",)
+cs = cnn.cursor()
+
+
+# ## Feature Engineering including the following steps: <a name="Feature Engineering including the following steps"></a>
+# 
+# ### Create new variables <a name="Create new variables"></a>
+# 
+# For example taking "time" from the ACTIVITY_DATE column and dividing it into four levels:
+# 
+# * Hours between 6 am and 12 pm = "Morning"
+# * Hours between 12 pm and 6 pm = "Afternoon"
+# * Hours between 6 pm and 11 pm = "Night"
+# * Hours between 12 am and before 6 am = "Midnight"
+# 
+# Create a duration to first Rx by considering the maximum number of days from NPP activity or receiving calls to the first Rx.
+# 
+# Convert all metrics with some levels (string variables) to 0 and 1, for example, call type has 16 different levels, which are counted per FP ID.
+# 
+# MESSAGE column is created based on MCP file with using tactic and asset IDs.
+# 
+# ### Dealing with missing values <a name="Dealing with missing values"></a>
+# 
+# Whenever possible, replacing missing values with the mode, mean, or median.
+# 
+# * As input for the model, 9 columns from the "ACTIVITY NPP ALL" table are considered. If all values are strings, we can use the column's Mode to fill in the missing values; if the column is numbers or integers, we can use mean or median to fill in the missing values. 
+# * Missing values are imputed only for FP IDs that exist in a specific table. For example to impute NA values for NPP activity, all missing values in the columns are populated before joining the table by Rep Calls or Rx Sales, because we don't want to give NPP activity to HCPs who have not been exposed/engaged.
+# * Call types and number of calls are selected from "ACTIVITY_REP_CALL".
+# * TRX CNT for both brand and market, product type (brand versus generic) and brand names are selected from "ACTIVITY_RX_SALES" table
+# * GENDER, DEGREE, SPECIALTY, STATE, and STAGE are selected from "Customer Master" table.
+# * If there are null/NA values in GENDER, DEGREE, SPECIALTY, STATE, and STAGE, they are converted to "UNKNOWN". 
+# * As a result, all four tables are merged into one, and any remaining NA/NULL values are converted to 0. The reason for this is that if an HCP has not received calls or has not written prescriptions, we do not want to give them TRx or calls.
+# 
+# ### Removing Outliers <a name="Removing Outliers"></a>
+# Remove outliers from Exposures, Engagements, Total Calls, TRx_CNT_BRAND, and TRX_CNT_MARKET.
+
+# ## A subset of the dataset that is used as input in the model (Selected columns) <a name="A subset of the dataset that is used as input in the model (Selected columns)"></a>
+
+# In[3]:
+
+
+sql = 'SELECT * FROM "SNOWPARK_QUICKSTART1"."PROFILING_ALGO_TEST"."VALTOCO_PROFILES_INPUT"'
+cs.execute(sql)
+my_data = cs.fetch_pandas_all()
+pd.set_option('display.max_columns', 100)
+
+
+# In[4]:
+
+
+pd.set_option('display.max_columns', 100)
+my_data.head()
+
+
+# ## K-mean Clustering <a name="K-mean Clustering"></a>
+# Clustering is an unsupervised machine learning model that automatically divides data into clusters, or groups of similar items. Clustering is used to discover knowledge rather than predict it, and it provides insight into the natural grouping of data. Items within a cluster should be very similar to one another but very different from those outside of it.
+# 
+# * The kmeans() function requires a dataframe containing only numeric data and a parameter specifying the desired number of clusters. 
+# 
+# ### Standardization data <a name="Standardization data"></a>
+# Standardized data based on Z-score. A value less than zero can be interpreted as a person having fewer than average of a variable and a value greater than zero implies that the person has more than average. 
+
+# In[5]:
+
+
+s_scaler = StandardScaler()
+data_z = pd.DataFrame(s_scaler.fit_transform(my_data.loc[:, my_data.columns != 'FP_CUST_ID']))
+
+
+# ### Select the desired number of clusters (K) <a name="Select the desired number of clusters (K)"></a>
+
+# In[6]:
+
+
+cs = []
+for i in range(1, 11):
+    kmeans = KMeans(n_clusters = i, init = 'k-means++', max_iter = 300, n_init = 10, random_state = 0)
+    kmeans.fit(data_z)
+    cs.append(kmeans.inertia_)
+plt.plot(range(1, 11), cs)
+plt.title('The Elbow Method')
+plt.xlabel('Number of clusters')
+plt.ylabel('CS')
+plt.show()
+
+
+# ### Based on the elbow method, we considered K=4 (Four Clusters)
+
+# In[7]:
+
+
+kmeans = KMeans(n_clusters=4) 
+kmeans.fit(data_z)
+
+
+# ### Number of HCPs per cluster <a name="Number of HCPs per cluster"></a>
+# There are 4 clusters in the Valtoco dataset:
+
+# In[8]:
+
+
+for i in range(len(kmeans.cluster_centers_)):
+  print("Cluster", i+1)
+  print("Number of HCPs:", sum(kmeans.labels_ == i))
+
+
+# Next, the clusters are added into the original dataset, so each HCP has a specific cluster.
+
+# In[9]:
+
+
+my_data['CLUSTER'] = kmeans.labels_ + 1
+
+
+# In[10]:
+
+
+my_data[['FP_CUST_ID','Total_Call','Exposure','Engagement','TRX_CNT_BRAND','TRX_CNT_MARKET','CLUSTER']].head()
+
+
+# ## Some information/details about HCPs per cluster <a name="Some information/details about HCPs per cluster"></a>
+
+# ### HCPs States <a name="HCPs States"></a>
+
+# The table below shows the average number of HCPs per state within each cluster.
+
+# In[11]:
+
+
+s = my_data.groupby('CLUSTER')[['STATE_AE','STATE_AK','STATE_AL','STATE_AP','STATE_AR','STATE_AZ','STATE_CA','STATE_CO','STATE_CT','STATE_DC','STATE_DE','STATE_FL','STATE_GA','STATE_GU','STATE_HI','STATE_IA','STATE_ID','STATE_IL','STATE_IN','STATE_KS','STATE_KY','STATE_LA','STATE_MA','STATE_MD','STATE_ME','STATE_MI','STATE_MN','STATE_MO','STATE_MS','STATE_MT','STATE_NC','STATE_ND','STATE_NE','STATE_NH','STATE_NJ','STATE_NM','STATE_NV','STATE_NY','STATE_OH','STATE_OK','STATE_OR','STATE_PA','STATE_PR','STATE_RI','STATE_SC','STATE_SD','STATE_TN','STATE_TX','STATE_UT','STATE_VA','STATE_VI','STATE_VT','STATE_WA','STATE_WI','STATE_WV','STATE_WY','STATE_Other']].mean()
+s.columns = [col.replace('STATE_', '') for col in s.columns]
+s
+
+
+# In[12]:
+
+
+s2 = my_data.groupby('CLUSTER')[['STATE_AE','STATE_AK','STATE_AL','STATE_AP','STATE_AR','STATE_AZ','STATE_CA','STATE_CO','STATE_CT','STATE_DC','STATE_DE','STATE_FL','STATE_GA','STATE_GU','STATE_HI','STATE_IA','STATE_ID','STATE_IL','STATE_IN','STATE_KS','STATE_KY','STATE_LA','STATE_MA','STATE_MD','STATE_ME','STATE_MI','STATE_MN','STATE_MO','STATE_MS','STATE_MT','STATE_NC','STATE_ND','STATE_NE','STATE_NH','STATE_NJ','STATE_NM','STATE_NV','STATE_NY','STATE_OH','STATE_OK','STATE_OR','STATE_PA','STATE_PR','STATE_RI','STATE_SC','STATE_SD','STATE_TN','STATE_TX','STATE_UT','STATE_VA','STATE_VI','STATE_VT','STATE_WA','STATE_WI','STATE_WV','STATE_WY','STATE_Other']].sum()
+s2.columns = [col.replace('STATE_', '') for col in s2.columns]
+max_total = pd.melt(s2,var_name='STATES', value_name='MAXIMUM_TOTAL',ignore_index=False).sort_values(['CLUSTER', 'MAXIMUM_TOTAL'],ascending=False).groupby(['CLUSTER']).first().reset_index()
+max_average = pd.melt(s,var_name='STATES', value_name='MAXIMUM_AVERAGE',ignore_index=False).sort_values(['CLUSTER', 'MAXIMUM_AVERAGE'],ascending=False).groupby(['CLUSTER']).first().reset_index()
+max_average['MAXIMUM_AVERAGE'] = round(max_average['MAXIMUM_AVERAGE'], 3)
+max_total = max_total[['MAXIMUM_TOTAL']]
+result_states = pd.concat([max_average, max_total], axis=1, join='inner')
+result_states
+
+
+# In[13]:
+
+
+percent1 = round(result_states['MAXIMUM_AVERAGE'].iloc[0]*100,2)
+state1 = result_states['STATES'].iloc[0]
+print("The majority of HCPs ({}%)".format(percent1), end='')
+print(" in Cluster 1 reside in {}".format(state1))
+percent2 = round(result_states['MAXIMUM_AVERAGE'].iloc[1]*100,2)
+state2 = result_states['STATES'].iloc[1]
+print("The majority of HCPs ({}%)".format(percent2), end='')
+print(" in Cluster 2 reside in {}".format(state2))
+percent3 = round(result_states['MAXIMUM_AVERAGE'].iloc[2]*100,2)
+state3 = result_states['STATES'].iloc[2]
+print("The majority of HCPs ({}%)".format(percent3), end='')
+print(" in Cluster 3 reside in {}".format(state3))
+percent4 = round(result_states['MAXIMUM_AVERAGE'].iloc[3]*100,2)
+state4 = result_states['STATES'].iloc[3]
+print("The majority of HCPs ({}%)".format(percent4), end='')
+print(" in Cluster 4 reside in {}".format(state4))
+
+
+# In[14]:
+
+
+# jupyter nbconvert --to html --TagRemovePreprocessor.remove_cell_tags='{"hide_code"}' Profiling_Algo.ipynb
+# jupyter nbconvert --to html --no-input Profiling_Algo.ipynb
+
+
+# ### HCPs Gender <a name="HCPs Gender"></a>
+
+# In[15]:
+
+
+g = my_data.groupby('CLUSTER')[['GENDER_F','GENDER_M','GENDER_UNKNOWN']].mean()
+round(g,2)
+
+
+# In[16]:
+
+
+F_Max_Cluster = g.groupby('CLUSTER')['GENDER_F'].max().idxmax()
+M_Max_Cluster = g.groupby('CLUSTER')['GENDER_M'].max().idxmax()
+U_Max_Cluster = g.groupby('CLUSTER')['GENDER_UNKNOWN'].max().idxmax()
+
+print("According to the results, cluster {} ".format(F_Max_Cluster), end='')
+print("has the most females and cluster {} ".format(M_Max_Cluster), end='') 
+print("has the most males. Cluster {} ".format(U_Max_Cluster), end='')
+print("has the most unknown cases.")
+
+
+# ### HCPs TRx, Calls, Exposures, and Engagements <a name="HCPs TRx, Calls, Exposures, and Engagements"></a>
+
+# In[17]:
+
+
+d = my_data.groupby('CLUSTER')[['TRX_CNT_BRAND','Exposure','Engagement', 'Total_Call']].mean()
+d2 = my_data.groupby('CLUSTER')[['TRX_CNT_BRAND','Exposure','Engagement', 'Total_Call']].sum()
+d.columns = [str(col) + '_Average' for col in d.columns]
+d2.columns = [str(col) + '_Sum' for col in d2.columns]
+dff = pd.concat([d, d2], axis=1, join='inner')
+round(dff,3)
+
+
+# In[18]:
+
+
+TRx_Max_Cluster = dff.groupby('CLUSTER')['TRX_CNT_BRAND_Average'].max().idxmax()
+Exp_Max_Cluster = dff.groupby('CLUSTER')['Exposure_Sum'].max().idxmax()
+Eng_Max_Cluster = dff.groupby('CLUSTER')['Engagement_Sum'].max().idxmax()
+Call_Max_Cluster = dff.groupby('CLUSTER')['Total_Call_Average'].max().idxmax()
+TRx_Min_Cluster = dff.groupby('CLUSTER')['TRX_CNT_BRAND_Average'].min().idxmin()
+Exp_Min_Cluster = dff.groupby('CLUSTER')['Exposure_Average'].min().idxmin()
+Eng_Min_Cluster = dff.groupby('CLUSTER')['Engagement_Average'].min().idxmin()
+Call_Min_Cluster = dff.groupby('CLUSTER')['Total_Call_Average'].min().idxmin()
+
+print("Based on the results, HCPs in Cluster {} ".format(TRx_Max_Cluster), end='')
+print("have the greatest average of Brand TRx among all HCPs.")
+print("According to the results, HCPs in Cluster {} ".format(Call_Max_Cluster), end='')
+print("have the highest average of calls among all HCPs.")
+print("HCPs in cluster {} ".format(Exp_Max_Cluster), end='')
+print("have the highest number of Exposures.")
+print("HCPs in cluster {} ".format(Eng_Max_Cluster), end='')
+print("have the highest number of Engagements.")
+print("Cluster {} ".format(Exp_Min_Cluster), end='')
+print("contains the HCPs with the lowest average of Engagements and Exposures and ", end='') 
+print("cluster {} ".format(Call_Min_Cluster), end='')
+print("has the lowest average of Calls, and cluster {} ".format(TRx_Min_Cluster), end='')
+print("includes lowest average of Brand TRx among all clusters.")
+
+
+# ###  <a name="HCPs TRx"></a>
+
+# In[19]:
+
+
+t = my_data.groupby('CLUSTER')[['TRX_CNT_BRAND','TRX_CNT_MARKET']].mean()
+t2 = my_data.groupby('CLUSTER')[['TRX_CNT_BRAND','TRX_CNT_MARKET']].sum()
+t.columns = [str(col) + '_Average' for col in t.columns]
+t2.columns = [str(col) + '_Sum' for col in t2.columns]
+tt = pd.concat([t, t2], axis=1, join='inner')
+round(tt,2)
+
+
+# In[20]:
+
+
+max_brand = tt.groupby('CLUSTER')['TRX_CNT_BRAND_Average'].max().idxmax()
+max_market = tt.groupby('CLUSTER')['TRX_CNT_MARKET_Average'].max().idxmax()
+
+min_brand = tt.groupby('CLUSTER')['TRX_CNT_BRAND_Average'].min().idxmin()
+min_market = tt.groupby('CLUSTER')['TRX_CNT_MARKET_Average'].min().idxmin()
+
+print("According to the results, HCPs in Cluster {} ".format(max_brand), end='')
+print("have the greatest average of Brand TRx and", end='')
+print(" HCPs in Cluster {} ".format(max_market), end='')
+print("have the highest average of Market TRx among all HCPs.")
+print("Cluster {} ".format(min_brand), end='')
+print("contains the HCPs with the lowest average of Brand TRx and ", end='') 
+print("cluster {} ".format(min_market), end='')
+print("has the lowest average of Market TRx.")
+
+
+# ### HCPs Product Type <a name="HCPs TRx Type"></a>
+
+# In[21]:
+
+
+product = my_data.groupby('CLUSTER')[['PRODUCT_TYPE_BRAND','PRODUCT_TYPE_GENERIC']].mean()
+round(product,2)
+
+
+# In[22]:
+
+
+max_pro = product.groupby('CLUSTER')['PRODUCT_TYPE_BRAND'].max().idxmax()
+max_pro2 = product.groupby('CLUSTER')['PRODUCT_TYPE_GENERIC'].max().idxmax()
+
+print("The results show that HCPs in Cluster {} ".format(max_pro), end='')
+print("have the highest average of Brand products and", end='')
+print(" HCPs in Cluster {} ".format(max_pro2), end='')
+print("have the highest average of Generic products among all HCPs.")
+
+
+# ### HCPs Brand Names <a name="HCPs TRx Names"></a>
+
+# In[23]:
+
+
+name1 = my_data.groupby('CLUSTER')[['DIASTAT','DIAZEPAM_RECTAL_GEL','NAYZILAM','VALTOCO']].mean()
+name2 = my_data.groupby('CLUSTER')[['DIASTAT','DIAZEPAM_RECTAL_GEL','NAYZILAM','VALTOCO']].sum()
+name1.columns = [str(col) + '_Average' for col in name1.columns]
+name2.columns = [str(col) + '_Sum' for col in name2.columns]
+name = pd.concat([name1, name2], axis=1, join='inner')
+round(name,1)
+
+
+# ### HCPs Degree <a name="HCPs Degree"></a>
+
+# In[24]:
+
+
+d = my_data.groupby('CLUSTER')[['DEGREE_DDS','DEGREE_DO','DEGREE_DPM','DEGREE_DVM','DEGREE_LPN','DEGREE_MD','DEGREE_MSN','DEGREE_ND','DEGREE_NP','DEGREE_OD','DEGREE_OTH','DEGREE_PA','DEGREE_PHAR','DEGREE_PHD','DEGREE_PSY','DEGREE_RN']].mean()
+d.columns = [col.replace('DEGREE_', '') for col in d.columns]
+round(d,2)
+
+
+# In[25]:
+
+
+degree = pd.melt(d,var_name='DEGREES', value_name='MAXIMUM_AVERAGE',ignore_index=False).sort_values(['CLUSTER', 'MAXIMUM_AVERAGE'],ascending=False).groupby(['CLUSTER']).first().reset_index()
+degree['MAXIMUM_AVERAGE'] = round(degree['MAXIMUM_AVERAGE'], 3)
+degree1 = round(degree['MAXIMUM_AVERAGE'].iloc[0]*100,2)
+d1_name = degree['DEGREES'].iloc[0]
+print("Cluster1 : The majority of HCPs have an {} Degree".format(d1_name), end='')
+print(" which is about {}%".format(degree1))
+
+degree2 = round(degree['MAXIMUM_AVERAGE'].iloc[1]*100,2)
+d2_name = degree['DEGREES'].iloc[1]
+print("Cluster2 : The majority of HCPs have an {} Degree".format(d2_name), end='')
+print(" which is about {}%".format(degree2))
+
+degree3 = round(degree['MAXIMUM_AVERAGE'].iloc[2]*100,2)
+d3_name = degree['DEGREES'].iloc[2]
+print("Cluster3 : The majority of HCPs have an {} Degree".format(d3_name), end='')
+print(" which is about {}%".format(degree3))
+
+degree4 = round(degree['MAXIMUM_AVERAGE'].iloc[3]*100,2)
+d4_name = degree['DEGREES'].iloc[3]
+print("Cluster4 : The majority of HCPs have an {} Degree".format(d4_name), end='')
+print(" which is about {}%".format(degree4))
+
+
+# ### HCPs Specialty <a name="HCPs Specialty"></a>
+
+# In[28]:
+
+
+sp = my_data.groupby('CLUSTER')[['SPECIALTY_AOTH','SPECIALTY_CHNEURO','SPECIALTY_EPIL','SPECIALTY_FP/GP','SPECIALTY_NEURO','SPECIALTY_NP/PA','SPECIALTY_OTH','SPECIALTY_PED']].mean()
+round(sp,2)
+
+
+# In[29]:
+
+
+sp.columns = [col.replace('SPECIALTY_', '') for col in sp.columns]
+specialty = pd.melt(sp,var_name='SPECIALTY', value_name='MAXIMUM_AVERAGE',ignore_index=False).sort_values(['CLUSTER', 'MAXIMUM_AVERAGE'],ascending=False).groupby(['CLUSTER']).first().reset_index()
+specialty['MAXIMUM_AVERAGE'] = round(specialty['MAXIMUM_AVERAGE'], 3)
+specialty1 = round(specialty['MAXIMUM_AVERAGE'].iloc[0]*100,2)
+sp1_name = specialty['SPECIALTY'].iloc[0]
+print("Cluster1 : Most of the HCPs are {} specialists".format(sp1_name), end='')
+print(" which is about {}%".format(specialty1))
+
+specialty2 = round(specialty['MAXIMUM_AVERAGE'].iloc[1]*100,2)
+sp2_name = specialty['SPECIALTY'].iloc[1]
+print("Cluster2 : Most of the HCPs are {} specialists".format(sp2_name), end='')
+print(" which is about {}%".format(specialty2))
+
+specialty3 = round(specialty['MAXIMUM_AVERAGE'].iloc[2]*100,2)
+sp3_name = specialty['SPECIALTY'].iloc[2]
+print("Cluster3 : Most of the HCPs are {} specialists".format(sp3_name), end='')
+print(" which is about {}%".format(specialty3))
+
+specialty4 = round(specialty['MAXIMUM_AVERAGE'].iloc[3]*100,2)
+sp4_name = specialty['SPECIALTY'].iloc[3]
+print("Cluster4 : Most of the HCPs are {} specialists".format(sp4_name), end='')
+print(" which is about {}%".format(specialty4))
+
+
+# ### HCPs Stage/Segment <a name="HCPs Stage"></a>
+
+# In[30]:
+
+
+st = my_data.groupby('CLUSTER')[['STAGE_Adopter','STAGE_Advocate','STAGE_Aware','STAGE_Educated','STAGE_Trialist','STAGE_Unaware']].sum()
+st.columns = [col.replace('STAGE_', '') for col in st.columns]
+st
+
+
+# In[31]:
+
+
+st2 = my_data.groupby('CLUSTER')[['STAGE_Adopter','STAGE_Advocate','STAGE_Aware','STAGE_Educated','STAGE_Trialist','STAGE_Unaware']].mean()
+st2.columns = [col.replace('STAGE_', '') for col in st2.columns]
+st2 = round(st2,3)
+st2 = pd.melt(st2,var_name='STAGE', value_name='MAXIMUM_AVERAGE',ignore_index=False).sort_values(['CLUSTER', 'MAXIMUM_AVERAGE'],ascending=False).groupby(['CLUSTER']).first().reset_index()
+stage1 = round(st2['MAXIMUM_AVERAGE'].iloc[0]*100,2)
+stage1_name = st2['STAGE'].iloc[0]
+print("{}%".format(stage1), end='')
+print(" of HCPs in Cluster 1 are classified as {} ".format(stage1_name))
+
+stage2 = round(st2['MAXIMUM_AVERAGE'].iloc[1]*100,2)
+stage2_name = st2['STAGE'].iloc[1]
+print("{}%".format(stage2), end='')
+print(" of HCPs in Cluster 2 are classified as {} ".format(stage2_name))
+
+stage3 = round(st2['MAXIMUM_AVERAGE'].iloc[2]*100,2)
+stage3_name = st2['STAGE'].iloc[2]
+print("{}%".format(stage3), end='')
+print(" of HCPs in Cluster 3 are classified as {} ".format(stage3_name))
+
+stage4 = round(st2['MAXIMUM_AVERAGE'].iloc[3]*100,2)
+stage4_name = st2['STAGE'].iloc[3]
+print("{}%".format(stage4), end='')
+print(" of HCPs in Cluster 4 are classified as {} ".format(stage4_name))
+
+
+# ### HCPs Time of NPP Activity <a name="HCPs Time of NPP Activity"></a>
+
+# The average number of hours spent by HCPs on NPP activities.
+
+# In[32]:
+
+
+npp_time = my_data.groupby('CLUSTER')[['Activity_Afternoom','Activity_Midnight','Activity_Morning','Activity_Night']].mean()
+round(npp_time,2)
+
+
+# In[33]:
+
+
+npp_time2 = my_data.groupby('CLUSTER')[['Activity_Afternoom','Activity_Midnight','Activity_Morning','Activity_Night']].sum()
+npp_time2 = round(npp_time2,3)
+npp_time2_1 = pd.melt(npp_time2,var_name='Activity_Time(Highest)', value_name='TOTAl_HIGHEST',ignore_index=False).sort_values(['CLUSTER', 'TOTAl_HIGHEST'],ascending=False).groupby(['CLUSTER']).first().reset_index()
+npp_time2_2 = pd.melt(npp_time2,var_name='Activity_Time(Lowest)', value_name='TOTAL_LOWEST',ignore_index=False).sort_values(['CLUSTER', 'TOTAL_LOWEST'],ascending=True).groupby(['CLUSTER']).first().reset_index()
+npp_time2_2 = npp_time2_2[['Activity_Time(Lowest)','TOTAL_LOWEST']]
+npp_timee = pd.concat([npp_time2_1, npp_time2_2], axis=1, join='inner')
+round(npp_timee,3)
+
+
+# HCPs in all clusters have the highest NPP activity at night (between 6 p.m. and 12 a.m.) and the lowest activity in the morning (hours between 6 a.m. and 12 p.m.)
+
+# ### HCPs Type of NPP Activity <a name="HCPs Type of NPP Activity"></a>
+
+# In[34]:
+
+
+npp_act = my_data.groupby('CLUSTER')[['Bounced','Click','Content_View','Delivered','Form_Fill','Headline_View','Impression','Like','Open','Sent','Unsubscribed','Video_Play','View']].sum()
+npp_act
+
+
+# The total number of activities based on activity types.
+
+# In[35]:
+
+
+npp_act2 = my_data.groupby('CLUSTER')[['Bounced','Click','Content_View','Delivered','Form_Fill','Headline_View','Impression','Like','Open','Sent','Unsubscribed','Video_Play','View']].mean()
+npp_act2 = round(npp_act2,3)
+npp_act2_1 = pd.melt(npp_act2,var_name='NPP_Activity(Highest)', value_name='AVERAGE_HIGHEST',ignore_index=False).sort_values(['CLUSTER', 'AVERAGE_HIGHEST'],ascending=False).groupby(['CLUSTER']).first().reset_index()
+npp_act2_2 = pd.melt(npp_act2,var_name='NPP_Activity(Lowest)', value_name='AVERAGE_LOWEST',ignore_index=False).sort_values(['CLUSTER', 'AVERAGE_LOWEST'],ascending=True).groupby(['CLUSTER']).first().reset_index()
+npp_act2_2 = npp_act2_2[['NPP_Activity(Lowest)','AVERAGE_LOWEST']]
+npp_actt = pd.concat([npp_act2_1, npp_act2_2], axis=1, join='inner')
+round(npp_actt,3)
+
+
+# In[36]:
+
+
+act1_name = npp_actt['NPP_Activity(Highest)'].iloc[0]
+act1_name_l = npp_actt['NPP_Activity(Lowest)'].iloc[0]
+print("'{}' is the most common activity type for HCPs in Cluster 1.".format(act1_name), end='')
+print(" and '{}' is the least common activity type among HCPs in Cluster 1.".format(act1_name_l))
+
+act2_name = npp_actt['NPP_Activity(Highest)'].iloc[1]
+act2_name_l = npp_actt['NPP_Activity(Lowest)'].iloc[1]
+print("'{}' is the most common activity type for HCPs in Cluster 2.".format(act2_name), end='')
+print(" and '{}' is the least common activity type among HCPs in Cluster 2.".format(act2_name_l))
+
+act3_name = npp_actt['NPP_Activity(Highest)'].iloc[2]
+act3_name_l = npp_actt['NPP_Activity(Lowest)'].iloc[2]
+print("'{}' is the most common activity type for HCPs in Cluster 3.".format(act3_name), end='')
+print(" and '{}' is the least common activity type among HCPs in Cluster 3.".format(act3_name_l))
+
+act4_name = npp_actt['NPP_Activity(Highest)'].iloc[3]
+act4_name_l = npp_actt['NPP_Activity(Lowest)'].iloc[3]
+print("'{}' is the most common activity type for HCPs in Cluster 4.".format(act4_name), end='')
+print(" and '{}' is the least common activity type among HCPs in Cluster 4.".format(act4_name_l))
+
+
+# ### HCPs Media Partners <a name="HCPs Media Partners"></a>
+
+# The total number of HCPs per media partners.
+
+# In[37]:
+
+
+media = my_data.groupby('CLUSTER')[['VENDOR_DeepIntent','VENDOR_Doximity','VENDOR_Marketo','VENDOR_RXNT','VENDOR_TI Health']].sum()
+media.columns = [col.replace('VENDOR_', '') for col in media.columns]
+media
+
+
+# In[38]:
+
+
+media2 = my_data.groupby('CLUSTER')[['VENDOR_DeepIntent','VENDOR_Doximity','VENDOR_Marketo','VENDOR_RXNT','VENDOR_TI Health']].sum()
+media2 = round(media2,3)
+media2.columns = [col.replace('VENDOR_', '') for col in media2.columns]
+media2_1 = pd.melt(media2,var_name='Vendors(Highest)', value_name='AVERAGE_HIGHEST',ignore_index=False).sort_values(['CLUSTER', 'AVERAGE_HIGHEST'],ascending=False).groupby(['CLUSTER']).first().reset_index()
+media2_2 = pd.melt(media2,var_name='Vendors(Lowest)', value_name='AVERAGE_LOWEST',ignore_index=False).sort_values(['CLUSTER', 'AVERAGE_LOWEST'],ascending=True).groupby(['CLUSTER']).first().reset_index()
+media2_2 = media2_2[['Vendors(Lowest)','AVERAGE_LOWEST']]
+mediaa2 = pd.concat([media2_1, media2_2], axis=1, join='inner')
+
+
+media1_name = mediaa2['Vendors(Highest)'].iloc[0]
+media1_name_l = mediaa2['Vendors(Lowest)'].iloc[0]
+print("'{}' has the most number of media partners for HCPs in Cluster 1.".format(media1_name), end='')
+print(" and '{}' has the lowest number of media partners for HCPs in Cluster 1.".format(media1_name_l))
+
+media2_name = mediaa2['Vendors(Highest)'].iloc[1]
+media2_name_l = mediaa2['Vendors(Lowest)'].iloc[1]
+print("'{}' has the most number of media partners for HCPs in Cluster 2.".format(media2_name), end='')
+print(" and '{}' has the lowest number of media partners for HCPs in Cluster 2.".format(media2_name_l))
+
+media3_name = mediaa2['Vendors(Highest)'].iloc[2]
+media3_name_l = mediaa2['Vendors(Lowest)'].iloc[2]
+print("'{}' has the most number of media partners for HCPs in Cluster 3.".format(media3_name), end='')
+print(" and '{}' has the lowest number of media partners for HCPs in Cluster 3.".format(media3_name_l))
+
+media4_name = mediaa2['Vendors(Highest)'].iloc[3]
+media4_name_l = mediaa2['Vendors(Lowest)'].iloc[3]
+print("'{}' has the most number of media partners for HCPs in Cluster 4.".format(media4_name), end='')
+print(" and '{}' has the lowest number of media partners for HCPs in Cluster 4.".format(media4_name_l))
+
+
+# ### HCPs Duration to First Rx <a name="HCPs Duration to First Rx"></a>
+
+# Duration to first Rx, defined as the number of days from different activities to first Rx, is converted to months (divided by 30), and HCPs who wrote the first prescription within the first 6 months are considered.
+
+# In[39]:
+
+
+dur = my_data[(my_data['Duration'] > 0)]
+dur['MONTHLY'] = round(dur['Duration'].div(30))
+dur = dur.loc[dur['MONTHLY'] < 7]
+dur = dur.groupby('CLUSTER')[['MONTHLY']].mean()
+round(dur,2)
+
+
+# In[40]:
+
+
+dur_max_Cluster = dur.groupby('CLUSTER')['MONTHLY'].max().idxmax()
+dur_Min_Cluster = dur.groupby('CLUSTER')['MONTHLY'].min().idxmin()
+
+print("HCPs in cluster {} ".format(dur_max_Cluster), end='')
+print("have the longest time to write the first prescription within the first 6 months.")
+
+print("HCPs in cluster {} ".format(dur_Min_Cluster), end='')
+print("have the shortest time to write the first prescription within the first 6 months.")
+
+
+# In[41]:
+
+
+dur2 = my_data.groupby('CLUSTER')[['Calls/Duration','Exposure/Duration','Engagement/Duration']].mean()
+dur2
+
+
+# ###  Duration to First Rx for Rep Called On, NPP Exposed, and NPP Engaged HCPs <a name="HCPs Duration"></a>
+
+# In[42]:
+
+
+dur2_Min1 = dur2.groupby('CLUSTER')['Calls/Duration'].min().idxmin()
+dur2_Min2 = dur2.groupby('CLUSTER')['Exposure/Duration'].min().idxmin()
+dur2_Min3 = dur2.groupby('CLUSTER')['Engagement/Duration'].min().idxmin()
+
+dur2_Max1 = dur2.groupby('CLUSTER')['Calls/Duration'].max().idxmax()
+dur2_Max2 = dur2.groupby('CLUSTER')['Exposure/Duration'].max().idxmax()
+dur2_Max3 = dur2.groupby('CLUSTER')['Engagement/Duration'].max().idxmax()
+
+print("HCPs who received a rep call have the shortest time to write the first prescription in cluster {} ".format(dur2_Min1))
+print("HCPs who received a rep call have the longest time to write the first prescription in cluster {} ".format(dur2_Max1))
+
+print("HCPs who are NPP exposed have the shortest time to write the first prescription in cluster {} ".format(dur2_Min2))
+print("HCPs who are NPP exposed have the longest time to write the first prescription in cluster {} ".format(dur2_Max2))
+
+print("HCPs who are NPP engaged have the shortest time to write the first prescription in cluster {} ".format(dur2_Min3))
+print("HCPs who are NPP engaged have the longest time to write the first prescription in cluster {} ".format(dur2_Max3))
+
+
+# ### HCPs Target Type <a name="HCPs Target Type"></a>
+
+# In[43]:
+
+
+my_data['NPP_TARGET'] = np.where((my_data['Exposure'] > 0) & (my_data['Total_Call'] == 0) |  
+                                 (my_data['Engagement'] > 0) & (my_data['Total_Call'] == 0), 1, 0)
+my_data['REP_TARGET'] = np.where((my_data['Exposure'] == 0) & (my_data['Engagement'] == 0) & (my_data['Total_Call'] > 0), 1, 0)
+my_data['No_NPP_No_REP'] = np.where((my_data['Exposure'] == 0) & (my_data['Total_Call'] == 0) & (my_data['Engagement'] == 0), 1, 0)
+my_data['NPP_REP'] = np.where((my_data['Exposure'] > 0) & (my_data['Total_Call'] > 0) |  
+                                 (my_data['Engagement'] > 0) & (my_data['Total_Call'] > 0), 1, 0)
+
+target_avg = my_data.groupby('CLUSTER')[['NPP_TARGET', 'REP_TARGET', 'NPP_REP', 'No_NPP_No_REP']].mean()
+target_sum = my_data.groupby('CLUSTER')[['NPP_TARGET', 'REP_TARGET', 'NPP_REP', 'No_NPP_No_REP']].sum()
+target_sum.columns = [str(col) + '_SUM' for col in target_sum.columns]
+target_sum = target_sum[['NPP_TARGET_SUM', 'REP_TARGET_SUM', 'NPP_REP_SUM', 'No_NPP_No_REP_SUM']]
+target_avg.columns = [str(col) + '_AVG' for col in target_avg.columns]
+targets = pd.concat([target_avg, target_sum], axis=1, join='inner')
+round(targets,3)
+
+
+# In[44]:
+
+
+tar_Max1 = targets.groupby('CLUSTER')['NPP_TARGET_AVG'].max().idxmax()
+tar_Max2 = targets.groupby('CLUSTER')['REP_TARGET_AVG'].max().idxmax()
+tar_Max3 = targets.groupby('CLUSTER')['NPP_REP_AVG'].max().idxmax()
+tar_Max4 = targets.groupby('CLUSTER')['No_NPP_No_REP_AVG'].max().idxmax()
+
+print("According to the results, cluster {} ".format(tar_Max1), end = '')
+print("has the highest average of NPP targets and cluster {} ".format(tar_Max2), end = '')
+print("has the greatest average of REP targets. Cluster {} ".format(tar_Max3), end = '')
+print("has the highest average of HCPs who have received calls and exposed/engaged.", end = '')
+print(" Cluster {} ".format(tar_Max4), end = '')
+print("has the highest average of HCPs who have no calls, exposure, and engagement.")
+
+
+# ### HCPs Call Types <a name="HCPs Call Types"></a>
+
+# The average of HCPs call types per cluster.
+
+# In[45]:
+
+
+call1 = my_data.groupby('CLUSTER')[['Activity','Activity_Live','Activity_Virtual','Call_Live','Call_Virtual','Email/E-Fax','Engage','Lunch_Learn','Phone','Prescriber_HCP_Call_Live','Prescriber_HCP_Call_Virtual','Staff_Interaction_Live','Staff_Interaction_Virtual','Visit','Web_Virtual_Call','Zoom']].mean()
+call2 = my_data.groupby('CLUSTER')[['Activity','Activity_Live','Activity_Virtual','Call_Live','Call_Virtual','Email/E-Fax','Engage','Lunch_Learn','Phone','Prescriber_HCP_Call_Live','Prescriber_HCP_Call_Virtual','Staff_Interaction_Live','Staff_Interaction_Virtual','Visit','Web_Virtual_Call','Zoom']].sum()
+call_df1 = pd.melt(call1,var_name='CALL_TYPE_AVG', value_name='AVERAGE_HIGHEST',ignore_index=False).sort_values(['CLUSTER', 'AVERAGE_HIGHEST'],ascending=False).groupby(['CLUSTER']).first().reset_index()
+call_df2 = pd.melt(call2,var_name='CALL_TYPE_SUM', value_name='SUM_HIGHEST',ignore_index=False).sort_values(['CLUSTER', 'SUM_HIGHEST'],ascending=False).groupby(['CLUSTER']).first().reset_index()
+call_df2 = call_df2[['CALL_TYPE_SUM','SUM_HIGHEST']]
+calls = pd.concat([call_df1, call_df2], axis=1, join='inner')
+round(calls,3)
+
+
+# In[46]:
+
+
+call1_name = calls['CALL_TYPE_AVG'].iloc[0]
+call2_name = calls['CALL_TYPE_AVG'].iloc[1]
+call3_name = calls['CALL_TYPE_AVG'].iloc[2]
+call4_name = calls['CALL_TYPE_AVG'].iloc[3]
+
+print("Based on the results, cluster 1 has the highest average number of call types as {} ".format(call1_name))
+print("Cluster 2 has the highest average of call types as {} ".format(call2_name))
+print("Cluster 3 has the highest average of call types as {} ".format(call3_name))
+print("Cluster 4 has the highest average of call types as {} ".format(call4_name))
+
+
+# ### HCPs Messages <a name="HCPs Messages"></a>
+
+# In[48]:
+
+
+msg = my_data.groupby('CLUSTER')[['MESSAGE_Brand Video','MESSAGE_Clinical Study Design','MESSAGE_Efficacy','MESSAGE_Formulary Wins','MESSAGE_Peer Feedback','MESSAGE_Safety','MESSAGE_Services and Support','MESSAGE_Share your experience (link to survey)','MESSAGE_Unknown','MESSAGE_Where else to use']].mean()
+msg.columns = [col.replace('MESSAGE_', '') for col in msg.columns]
+msg
+
+
+# Excluding "Unknown" Messages from data to have more clear results.
+
+# In[50]:
+
+
+msg = my_data.groupby('CLUSTER')[['MESSAGE_Brand Video','MESSAGE_Clinical Study Design','MESSAGE_Efficacy','MESSAGE_Formulary Wins','MESSAGE_Peer Feedback','MESSAGE_Safety','MESSAGE_Services and Support','MESSAGE_Share your experience (link to survey)','MESSAGE_Unknown','MESSAGE_Where else to use']].mean()
+msg.columns = [col.replace('MESSAGE_', '') for col in msg.columns]
+msg2 = my_data.groupby('CLUSTER')[['MESSAGE_Brand Video','MESSAGE_Clinical Study Design','MESSAGE_Efficacy','MESSAGE_Formulary Wins','MESSAGE_Peer Feedback','MESSAGE_Safety','MESSAGE_Services and Support','MESSAGE_Share your experience (link to survey)','MESSAGE_Unknown','MESSAGE_Where else to use']].sum()
+msg2.columns = [col.replace('MESSAGE_', '') for col in msg2.columns]
+
+msg = msg.drop('Unknown', axis=1)
+max_total = pd.melt(msg2,var_name='MESSAGES', value_name='MAXIMUM_TOTAL',ignore_index=False).sort_values(['CLUSTER', 'MAXIMUM_TOTAL'],ascending=False).groupby(['CLUSTER']).first().reset_index()
+max_average = pd.melt(msg,var_name='MESSAGES', value_name='MAXIMUM_AVERAGE',ignore_index=False).sort_values(['CLUSTER', 'MAXIMUM_AVERAGE'],ascending=False).groupby(['CLUSTER']).first().reset_index()
+max_average['MAXIMUM_AVERAGE'] = round(max_average['MAXIMUM_AVERAGE'], 3)
+max_total = max_total[['MAXIMUM_TOTAL']]
+result2 = pd.concat([max_average, max_total], axis=1, join='inner')
+round(result2,2)
+
+
+# In[51]:
+
+
+percent1 = round(result2['MAXIMUM_AVERAGE'].iloc[0]*100,2)
+msg1 = result2['MESSAGES'].iloc[0]
+print("The majority of HCPs ({}%)".format(percent1), end='')
+print(" in Cluster 1 received '{}' message".format(msg1))
+percent2 = round(result2['MAXIMUM_AVERAGE'].iloc[1]*100,2)
+msg2 = result2['MESSAGES'].iloc[1]
+print("The majority of HCPs ({}%)".format(percent2), end='')
+print(" in Cluster 2 received '{}' message".format(msg2))
+percent3 = round(result2['MAXIMUM_AVERAGE'].iloc[2]*100,2)
+msg3 = result2['MESSAGES'].iloc[2]
+print("The majority of HCPs ({}%)".format(percent3), end='')
+print(" in Cluster 3 received '{}' message.".format(msg3))
+percent4 = round(result2['MAXIMUM_AVERAGE'].iloc[3]*100,2)
+msg4 = result2['MESSAGES'].iloc[3]
+print("The majority of HCPs ({}%)".format(percent4), end='')
+print(" in Cluster 4 received '{}' message.".format(msg4))
+
+
+# ### HCPs Tactic <a name="HCPs Tactic"></a>
+
+# In[52]:
+
+
+tac = my_data.groupby('CLUSTER')[['TACTIC_Alert','TACTIC_Display','TACTIC_Video','TACTIC_Email','TACTIC_Web']].mean()
+tac.columns = [col.replace('TACTIC_', '') for col in tac.columns]
+tac2 = my_data.groupby('CLUSTER')[['TACTIC_Alert','TACTIC_Display','TACTIC_Video','TACTIC_Email','TACTIC_Web']].sum()
+tac2.columns = [col.replace('TACTIC_', '') for col in tac2.columns]
+
+max_total_tac = pd.melt(tac2,var_name='TACTIC', value_name='MAXIMUM_TOTAL',ignore_index=False).sort_values(['CLUSTER', 'MAXIMUM_TOTAL'],ascending=False).groupby(['CLUSTER']).first().reset_index()
+max_average = pd.melt(tac,var_name='TACTIC', value_name='MAXIMUM_AVERAGE',ignore_index=False).sort_values(['CLUSTER', 'MAXIMUM_AVERAGE'],ascending=False).groupby(['CLUSTER']).first().reset_index()
+max_average['MAXIMUM_AVERAGE'] = round(max_average['MAXIMUM_AVERAGE'], 3)
+max_total = max_total[['MAXIMUM_TOTAL']]
+result_tac = pd.concat([max_average, max_total], axis=1, join='inner')
+round(result_tac,2)
+
+
+# ## Conclusion <a name="Conclusion"></a>
+
+# In[53]:
+
+
+size1 = sum(kmeans.labels_ == 0)
+size2 = sum(kmeans.labels_ == 1)
+size3 = sum(kmeans.labels_ == 2)
+size4 = sum(kmeans.labels_ == 3)
+
+st2 = my_data.groupby('CLUSTER')[['STAGE_Adopter','STAGE_Advocate','STAGE_Aware','STAGE_Educated','STAGE_Trialist','STAGE_Unaware']].mean()
+st2.columns = [col.replace('STAGE_', '') for col in st2.columns]
+st2 = round(st2,3)
+st2 = pd.melt(st2,var_name='STAGE', value_name='MAXIMUM_AVERAGE',ignore_index=False).sort_values(['CLUSTER', 'MAXIMUM_AVERAGE'],ascending=False).groupby(['CLUSTER']).first().reset_index()
+stage1_name = st2['STAGE'].iloc[0]
+stage2_name = st2['STAGE'].iloc[1]
+stage3_name = st2['STAGE'].iloc[2]
+stage4_name = st2['STAGE'].iloc[3]
+
+target_avg = my_data.groupby('CLUSTER')[['NPP_TARGET', 'REP_TARGET', 'NPP_REP', 'No_NPP_No_REP']].mean()
+npp1 = round(target_avg['NPP_TARGET'].iloc[0]*100,2)
+rep1 = round(target_avg['REP_TARGET'].iloc[0]*100,2)
+npp_rep1 = round(target_avg['NPP_REP'].iloc[0]*100,2)
+no_npp_rep1 = round(target_avg['No_NPP_No_REP'].iloc[0]*100,2)
+
+npp2 = round(target_avg['NPP_TARGET'].iloc[1]*100,2)
+rep2 = round(target_avg['REP_TARGET'].iloc[1]*100,2)
+npp_rep2 = round(target_avg['NPP_REP'].iloc[1]*100,2)
+no_npp_rep2 = round(target_avg['No_NPP_No_REP'].iloc[1]*100,2)
+
+npp3 = round(target_avg['NPP_TARGET'].iloc[2]*100,2)
+rep3 = round(target_avg['REP_TARGET'].iloc[2]*100,2)
+npp_rep3 = round(target_avg['NPP_REP'].iloc[2]*100,2)
+no_npp_rep3 = round(target_avg['No_NPP_No_REP'].iloc[2]*100,2)
+
+npp4 = round(target_avg['NPP_TARGET'].iloc[3]*100,2)
+rep4 = round(target_avg['REP_TARGET'].iloc[3]*100,2)
+npp_rep4 = round(target_avg['NPP_REP'].iloc[3]*100,2)
+no_npp_rep4 = round(target_avg['No_NPP_No_REP'].iloc[3]*100,2)
+
+state1 = result_states['STATES'].iloc[0]
+state2 = result_states['STATES'].iloc[1]
+state3 = result_states['STATES'].iloc[2]
+state4 = result_states['STATES'].iloc[3]
+
+c1 = my_data[(my_data['CLUSTER'] == 1)]
+trx1 = round(c1['TRX_CNT_BRAND'].sum())
+c2 = my_data[(my_data['CLUSTER'] == 2)]
+trx2 = round(c2['TRX_CNT_BRAND'].sum())
+c3 = my_data[(my_data['CLUSTER'] == 3)]
+trx3 = round(c3['TRX_CNT_BRAND'].sum())
+c4 = my_data[(my_data['CLUSTER'] == 4)]
+trx4 = round(c4['TRX_CNT_BRAND'].sum())
+
+dur1 = round(dur['MONTHLY'].iloc[0],2)
+dur2 = round(dur['MONTHLY'].iloc[1],2)
+dur3 = round(dur['MONTHLY'].iloc[2],2)
+dur4 = round(dur['MONTHLY'].iloc[3],2)
+
+d1_name = degree['DEGREES'].iloc[0]
+d2_name = degree['DEGREES'].iloc[1]
+d3_name = degree['DEGREES'].iloc[2]
+d4_name = degree['DEGREES'].iloc[3]
+
+sp1_name = specialty['SPECIALTY'].iloc[0]
+sp2_name = specialty['SPECIALTY'].iloc[1]
+sp3_name = specialty['SPECIALTY'].iloc[2]
+sp4_name = specialty['SPECIALTY'].iloc[3]
+
+msg1 = result2['MESSAGES'].iloc[0]
+msg2 = result2['MESSAGES'].iloc[1]
+msg3 = result2['MESSAGES'].iloc[2]
+msg4 = result2['MESSAGES'].iloc[3]
+
+print("HCPs in cluster 1: Includes {} ".format(size1), end='')
+print("of HCPs. Most of the HCPs are classified as {} .".format(stage1_name), end='')
+print("This cluster contains {}% ".format(npp1), end='')
+print("NPP targets, {}% ".format(rep1), end='')
+print("Rep Called On targets, {}% ".format(npp_rep1), end='')
+print("NPP and Rep Called On targets, and, {}% ".format(no_npp_rep1), end='')
+print("HCPs who did not receive any rep calls and are not NPP exposed or engaged.", end='')
+print(" The majority of HCPs in this Cluster reside in {}.".format(state1), end='')
+print(" The total number of Brand TRx for HCPs in this cluster is {}".format(trx1), end='')
+print(" and for most of cases, the first prescription was written within {}".format(dur1), end='')
+print(" months. Cluster 1 has the highest average of call types as {}.".format(call1_name), end='')
+print(" The majority of cases have an {}".format(d1_name), end='')
+print(" degree, and this cluster has the most {}".format(sp1_name), end= '')
+print(" specialties. Most of the HCPs received '{}'".format(msg1), end='')
+print(" messages during the program.")
+print("                      ")
+
+
+print("HCPs in cluster 2: Includes {} ".format(size2), end='')
+print("of HCPs. Most of the HCPs are classified as {} .".format(stage2_name), end='')
+print("The cluster contains {}% ".format(npp2), end='')
+print("NPP targets, {}% ".format(rep2), end='')
+print("Rep Called On targets, {}% ".format(npp_rep2), end='')
+print("NPP and Rep Called On targets, and, {}% ".format(no_npp_rep2), end='')
+print("HCPs who did not receive any rep calls and are not NPP exposed or engaged.", end='')
+print(" The majority of HCPs in this Cluster reside in {}.".format(state2), end='')
+print(" The total number of Brand TRx for HCPs in this cluster is {}".format(trx2), end='')
+print(" and for most of cases, the first prescription was written within {}".format(dur2), end='')
+print(" months. Cluster 2 has the highest average of call types as {}.".format(call2_name), end='')
+print(" The majority of cases have an {}".format(d2_name), end='')
+print(" degree, and this cluster has the most {}".format(sp2_name), end= '')
+print(" specialties. Most of the HCPs received '{}'".format(msg2), end='')
+print(" messages during the program.")
+print("                      ")
+
+print("HCPs in cluster 3: Includes {} ".format(size3), end='')
+print("of HCPs. Most of the HCPs are classified as {} .".format(stage3_name), end='')
+print("The cluster contains {}% ".format(npp3), end='')
+print("NPP targets, {}% ".format(rep3), end='')
+print("Rep Called On targets, {}% ".format(npp_rep3), end='')
+print("NPP and Rep Called On targets, and, {}% ".format(no_npp_rep3), end='')
+print("HCPs who did not receive any rep calls and are not NPP exposed or engaged.", end='')
+print(" The majority of HCPs in this Cluster reside in {}.".format(state3), end='')
+print(" The total number of Brand TRx for HCPs in this cluster is {}".format(trx3), end='')
+print(" and for most of cases, the first prescription was written within {}".format(dur3), end='')
+print(" months. Cluster 3 has the highest average of call types as {}.".format(call3_name), end='')
+print(" The majority of cases have an {}".format(d3_name), end='')
+print(" degree, and this cluster has the most {}".format(sp3_name), end= '')
+print(" specialties. Most of the HCPs received '{}'".format(msg3), end='')
+print(" messages during the program.")
+print("                      ")
+
+print("HCPs in cluster 4: Includes {} ".format(size4), end='')
+print("of HCPs. Most of the HCPs are classified as {} .".format(stage4_name), end='')
+print("This cluster contains {}% ".format(npp4), end='')
+print("NPP targets, {}% ".format(rep4), end='')
+print("Rep Called On targets, {}% ".format(npp_rep4), end='')
+print("NPP and Rep Called On targets, and, {}% ".format(no_npp_rep4), end='')
+print("HCPs who did not receive any rep calls and are not NPP exposed or engaged.", end='')
+print(" The majority of HCPs in this Cluster reside in {}.".format(state4), end='')
+print(" The total number of Brand TRx for HCPs in this cluster is {}".format(trx4), end='')
+print(" and for most of cases, the first prescription was written within {}".format(dur4), end='')
+print(" months. Cluster 4 has the highest average of call types as {}.".format(call4_name), end='')
+print(" The majority of cases have an {}".format(d4_name), end='')
+print(" degree, and this cluster has the most {}".format(sp4_name), end= '')
+print(" specialties. Most of the HCPs received '{}'".format(msg4), end='')
+print(" messages during the program.")
+print("                      ")
+      
